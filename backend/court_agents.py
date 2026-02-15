@@ -4,54 +4,79 @@ Uses Anthropic Claude API to simulate courtroom proceedings
 """
 
 import os
+from typing import Dict, List, Optional
+
 from anthropic import Anthropic
-from typing import List, Dict, Optional
+
+
+class CourtAgentError(Exception):
+    """Raised when an agent cannot produce a valid response."""
 
 
 class CourtAgent:
-    """Base class for all court agents"""
-    
-    def __init__(self, role: str, system_prompt: str, api_key: str = None):
+    """Base class for all court agents."""
+
+    def __init__(
+        self,
+        role: str,
+        system_prompt: str,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        max_history_messages: int = 20,
+    ):
         self.role = role
         self.system_prompt = system_prompt
-        self.client = Anthropic(api_key=api_key or os.getenv('ANTHROPIC_API_KEY'))
-        self.conversation_history = []
-        self.model = "claude-sonnet-4-20250514"
-        
-    def respond(self, message: str, context: Optional[List[Dict]] = None) -> str:
-        """Generate a response based on the message and conversation history"""
-        
-        # Build messages
-        messages = context if context else self.conversation_history.copy()
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Call Claude API
-        try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=4000,
-                system=self.system_prompt,
-                messages=messages
+        self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
+        self.mock_mode = os.getenv("COURT_AGENT_ALLOW_MOCK", "1") == "1"
+        self.client = Anthropic(api_key=self.api_key) if self.api_key else None
+        if not self.client and not self.mock_mode:
+            raise CourtAgentError(
+                "Missing Anthropic API key. Set ANTHROPIC_API_KEY or enable COURT_AGENT_ALLOW_MOCK=1."
             )
-            
-            assistant_message = response.content[0].text
-            
-            # Update history
-            self.conversation_history.append({"role": "user", "content": message})
-            self.conversation_history.append({"role": "assistant", "content": assistant_message})
-            
-            return assistant_message
-            
-        except Exception as e:
-            return f"[Error: {str(e)}]"
+        self.conversation_history: List[Dict[str, str]] = []
+        self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+        self.max_history_messages = max_history_messages
+
+    def _trim_history(self) -> None:
+        if len(self.conversation_history) > self.max_history_messages:
+            self.conversation_history = self.conversation_history[-self.max_history_messages :]
+
+    def respond(self, message: str, context: Optional[List[Dict[str, str]]] = None) -> str:
+        """Generate a response based on the message and conversation history."""
+        messages = list(context) if context is not None else self.conversation_history.copy()
+        messages.append({"role": "user", "content": message})
+
+        if self.client is None:
+            assistant_message = self._mock_response(message)
+        else:
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4000,
+                    system=self.system_prompt,
+                    messages=messages,
+                )
+                assistant_message = response.content[0].text
+            except Exception as exc:
+                raise CourtAgentError(f"{self.role} failed to respond: {exc}") from exc
+
+        self.conversation_history.append({"role": "user", "content": message})
+        self.conversation_history.append({"role": "assistant", "content": assistant_message})
+        self._trim_history()
+
+        return assistant_message
+
+    def _mock_response(self, message: str) -> str:
+        """Deterministic local response for dev/testing without an Anthropic key."""
+        return (
+            f"[{self.role} MOCK RESPONSE]\n"
+            f"Instruction received: {message}\n"
+            "This is a local fallback response because ANTHROPIC_API_KEY is not configured."
+        )
 
 
-def create_judge_agent(case_data: Dict) -> CourtAgent:
-    """Create a judge agent with jurisdiction-specific instructions"""
-    
+def create_judge_agent(case_data: Dict, **agent_kwargs) -> CourtAgent:
+    """Create a judge agent with jurisdiction-specific instructions."""
     system_prompt = f"""You are an AI Judge presiding over a {case_data['jurisdiction']['court_level']} in {case_data['jurisdiction']['state_province']}, {case_data['jurisdiction']['country']}.
 
 CASE: {case_data['case_id']} - {case_data.get('case_name', 'Civil Dispute')}
@@ -71,7 +96,7 @@ APPLICABLE LAWS:
 
 PROCEEDING STRUCTURE:
 1. Opening statement - Plaintiff's attorney
-2. Opening statement - Defendant's attorney  
+2. Opening statement - Defendant's attorney
 3. Plaintiff's case presentation
 4. Defendant's case presentation
 5. Closing arguments
@@ -100,17 +125,21 @@ TONE: Formal, authoritative, fair, clear
 
 Begin by welcoming the court and explaining the process briefly.
 """
-    
-    return CourtAgent("Judge", system_prompt)
+
+    return CourtAgent("Judge", system_prompt, **agent_kwargs)
 
 
-def create_attorney_agent(side: str, case_data: Dict, research_findings: Optional[Dict] = None) -> CourtAgent:
-    """Create an attorney agent for plaintiff or defendant"""
-    
-    is_plaintiff = (side == "plaintiff")
-    party_data = case_data['plaintiff'] if is_plaintiff else case_data['defendant']
-    opponent_data = case_data['defendant'] if is_plaintiff else case_data['plaintiff']
-    
+def create_attorney_agent(
+    side: str,
+    case_data: Dict,
+    research_findings: Optional[Dict] = None,
+    **agent_kwargs,
+) -> CourtAgent:
+    """Create an attorney agent for plaintiff or defendant."""
+    is_plaintiff = side == "plaintiff"
+    party_data = case_data["plaintiff"] if is_plaintiff else case_data["defendant"]
+    opponent_data = case_data["defendant"] if is_plaintiff else case_data["plaintiff"]
+
     system_prompt = f"""You are an AI Attorney representing the {"PLAINTIFF" if is_plaintiff else "DEFENDANT"} in a {case_data['jurisdiction']['court_level']} case.
 
 CLIENT: {party_data['name']}
@@ -138,9 +167,8 @@ EVIDENCE AVAILABLE:
 
 KEY TIMELINE:
 """
-        for event in party_data.get('key_timeline', []):
+        for event in party_data.get("key_timeline", []):
             system_prompt += f"\n- {event['date']}: {event['event']}"
-    
     else:
         system_prompt += f"""
 DEFENDING AGAINST: {case_data['case_type']}
@@ -156,29 +184,28 @@ EVIDENCE AVAILABLE:
 {party_data['evidence_summary'].strip()}
 """
 
-    # Add research findings if available
     if research_findings:
-        system_prompt += f"""
+        system_prompt += """
 
 RESEARCH FINDINGS:
 You have conducted legal research. Use these findings strategically in your arguments:
 
 """
-        if 'case_law' in research_findings:
+        if "case_law" in research_findings:
             system_prompt += "\n**Relevant Case Law:**\n"
-            for case in research_findings['case_law'].get('cases', []):
+            for case in research_findings["case_law"].get("cases", []):
                 system_prompt += f"- {case['title']}: {case['snippet']}\n"
-            if research_findings['case_law'].get('summary'):
+            if research_findings["case_law"].get("summary"):
                 system_prompt += f"\nSummary: {research_findings['case_law']['summary']}\n"
-        
-        if 'industry_standards' in research_findings:
+
+        if "industry_standards" in research_findings:
             system_prompt += "\n**Industry Standards:**\n"
-            for std in research_findings['industry_standards'].get('standards', []):
+            for std in research_findings["industry_standards"].get("standards", []):
                 system_prompt += f"- {std}\n"
-        
-        if 'damages' in research_findings:
+
+        if "damages" in research_findings:
             system_prompt += "\n**Damages Guidance:**\n"
-            for method in research_findings['damages'].get('methods', []):
+            for method in research_findings["damages"].get("methods", []):
                 system_prompt += f"- {method}\n"
 
     system_prompt += """
@@ -217,20 +244,17 @@ TONE: Professional, confident, persuasive, clear
 
 Remember: You're working with actual facts your client provided. Present them in the best light while staying truthful.
 """
-    
-    return CourtAgent(f"Attorney ({side.title()})", system_prompt)
+
+    return CourtAgent(f"Attorney ({side.title()})", system_prompt, **agent_kwargs)
 
 
 def format_agent_message(role: str, message: str) -> str:
-    """Format an agent's message for display"""
-    
+    """Format an agent's message for display."""
     role_emoji = {
         "Judge": "⚖️",
         "Attorney (Plaintiff)": "👔",
-        "Attorney (Defendant)": "💼"
+        "Attorney (Defendant)": "💼",
     }
-    
     emoji = role_emoji.get(role, "💬")
     separator = "=" * 80
-    
     return f"\n{separator}\n{emoji} {role.upper()}\n{separator}\n{message}\n"
